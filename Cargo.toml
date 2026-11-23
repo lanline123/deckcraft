@@ -11,16 +11,23 @@ rust-version = "1.95"
 repository = "https://github.com/storytold/deckcraft"
 
 [workspace.dependencies]
+# qimu-skin baseline alignment: the file-format group below
+# (craft-opc / craft-cfb / craft-xml / craft-drawingml / craft-pptx) is
+# pinned to qimu's craft-libs baseline b9c7b69 -- the same rev the qimu
+# workspace's root [patch] forces -- so this workspace also builds
+# standalone against the craft-libs shape qimu compiles it with
+# (drawingml Chart gained category_format / date_1904 after 8048f8e;
+# crates/pptx convert.rs targets the new shape).
 # OPC part-name primitives and package reader/writer.
-craft-opc = { git = "https://github.com/storytold/craft-libs", rev = "8048f8ef92da80fb3ce5a056d59ca591ee66faf1", version = "0.1.0" }
+craft-opc = { git = "https://github.com/storytold/craft-libs", rev = "b9c7b6970382acb1da090d83eb21e51f7006763a", version = "0.1.0" }
 # Compound File Binary directory reads (password-protected deck detection).
-craft-cfb = { git = "https://github.com/storytold/craft-libs", rev = "8048f8ef92da80fb3ce5a056d59ca591ee66faf1", version = "0.1.0" }
+craft-cfb = { git = "https://github.com/storytold/craft-libs", rev = "b9c7b6970382acb1da090d83eb21e51f7006763a", version = "0.1.0" }
 # Bounded XML reader and writer primitives.
-craft-xml = { git = "https://github.com/storytold/craft-libs", rev = "8048f8ef92da80fb3ce5a056d59ca591ee66faf1", version = "0.1.0" }
+craft-xml = { git = "https://github.com/storytold/craft-libs", rev = "b9c7b6970382acb1da090d83eb21e51f7006763a", version = "0.1.0" }
 # DrawingML colours, themes, charts, tables and text (craft-libs#778, #792).
-craft-drawingml = { git = "https://github.com/storytold/craft-libs", rev = "8048f8ef92da80fb3ce5a056d59ca591ee66faf1", version = "0.1.0" }
+craft-drawingml = { git = "https://github.com/storytold/craft-libs", rev = "b9c7b6970382acb1da090d83eb21e51f7006763a", version = "0.1.0" }
 # PresentationML PPTX/POTX/PPSX reader and writer (craft-libs#778).
-craft-pptx = { git = "https://github.com/storytold/craft-libs", rev = "8048f8ef92da80fb3ce5a056d59ca591ee66faf1", version = "0.1.0" }
+craft-pptx = { git = "https://github.com/storytold/craft-libs", rev = "b9c7b6970382acb1da090d83eb21e51f7006763a", version = "0.1.0" }
 # Shared MCP stdio framing and protocol constants (craft-libs#778).
 craft-mcp-server = { git = "https://github.com/storytold/craft-libs", rev = "bc186ca719958fcce3b6ee24794277eabed14609", version = "0.1.0" }
 # internal
