@@ -1319,6 +1319,8 @@ fn chart_to(c: &dm_chart::Chart) -> cd_chart::Chart {
         y2_major: c.y2_major,
         y2_format: c.y2_format.clone(),
         y2_hidden: c.y2_hidden,
+        category_format: None,
+        date_1904: false,
         lang: c.lang.clone(),
         subtotals: c.subtotals.clone(),
         category_levels: c.category_levels.clone(),
@@ -1340,6 +1342,8 @@ fn chart_to(c: &dm_chart::Chart) -> cd_chart::Chart {
         out.data_table = parsed.data_table;
         out.first_slice_angle = parsed.first_slice_angle;
         out.pivot_source = parsed.pivot_source;
+        out.category_format = parsed.category_format;
+        out.date_1904 = parsed.date_1904;
         for (dst, src) in out.series.iter_mut().zip(parsed.series) {
             dst.refs = src.refs;
         }
