@@ -39,6 +39,15 @@ pub enum PdfError {
     NoPages,
     #[error("PDF writer: {0}")]
     Write(String),
+    /// Glyphs that would have been drawn as .notdef or without a ToUnicode mapping:
+    /// their characters are unrecoverable from the PDF (invisible in notes, garbage
+    /// when copied or searched). Krilla only records its validation errors for these
+    /// when a validator is configured, and export configures none, so the loss is
+    /// detected by the exporter itself and reported instead of silently emitting a
+    /// broken PDF. Install a font covering the text, fix the text, or (for slide
+    /// text) disable the text layer.
+    #[error("export would lose text: {count} glyph(s) have no covering font or no text mapping (first lost: {sample})")]
+    TextLoss { count: usize, sample: String },
 }
 
 impl From<write::WriteError> for PdfError {
@@ -178,7 +187,7 @@ fn export_inner(pres: &Presentation, opts: &PdfOptions) -> Result<Vec<u8>> {
     let pdf = writer.document_mut();
 
     let (sw, sh) = (pres.slide_size.width.max(1.0), pres.slide_size.height.max(1.0));
-    let mut ex = Exporter { pres, opts, fonts: HashMap::new(), backdrops: Backdrops::default() };
+    let mut ex = Exporter { pres, opts, fonts: HashMap::new(), backdrops: Backdrops::default(), text_loss: TextLoss::default() };
     // Page plan: per page, the slides on it with their boxes (page points).
     let pages = plan_pages(pres, opts, &slides, sw, sh);
     // Bookmarks and slide → page lookup for internal links.
@@ -223,6 +232,10 @@ fn export_inner(pres: &Presentation, opts: &PdfOptions) -> Result<Vec<u8>> {
             page.add_annotation(a);
         }
         page.finish();
+    }
+    if ex.text_loss.count > 0 {
+        let sample: String = ex.text_loss.samples.iter().collect();
+        return Err(PdfError::TextLoss { count: ex.text_loss.count, sample });
     }
     writer.finish().map_err(Into::into)
 }
@@ -388,6 +401,39 @@ struct Exporter<'a> {
     opts: &'a PdfOptions,
     fonts: HashMap<u32, Font>,
     backdrops: Backdrops,
+    /// Glyphs whose character would be unrecoverable from the exported PDF; fails the
+    /// export (see [`PdfError::TextLoss`]) instead of silently losing the text.
+    text_loss: TextLoss,
+}
+
+/// Count of glyphs that lost their character, with a few sample characters for the
+/// error message.
+#[derive(Default)]
+struct TextLoss {
+    count: usize,
+    samples: Vec<char>,
+}
+
+impl TextLoss {
+    fn note(&mut self, c: char) {
+        self.count += 1;
+        if self.samples.len() < 12 && !self.samples.contains(&c) {
+            self.samples.push(c);
+        }
+    }
+}
+
+/// One face run of a shaped plain-text word: the face, the segment's byte offset in
+/// the word, its glyphs with each glyph cluster's byte range in the segment, and the
+/// segment's width in points.
+type ShapedSeg = (std::sync::Arc<deckcraft_fonts::FontFace>, usize, Vec<(deckcraft_fonts::ShapedGlyph, std::ops::Range<usize>)>, f64);
+
+/// A word of plain text (notes) shaped for drawing: its face runs and the characters
+/// no face could cover.
+struct ShapedWord {
+    text: String,
+    segs: Vec<ShapedSeg>,
+    lost: Vec<char>,
 }
 
 fn tf(a: Affine) -> Transform {
@@ -591,16 +637,35 @@ impl Exporter<'_> {
             let n = run.glyphs.len();
             let ranges = glyph_text_ranges(&text, run.chars, &run.cells, n);
             let (x0, y0) = (run.glyphs[0].1, run.glyphs[0].2);
-            let kg: Vec<KrillaGlyph> = run
+            // Ranges in which at least one real glyph lands: a .notdef glyph sharing
+            // such a range (the ZWJ of an emoji sequence, say) loses nothing, since
+            // the cluster's text is written for the real glyph.
+            let mapped: Vec<(usize, usize)> = run
                 .glyphs
                 .iter()
                 .enumerate()
-                .map(|(gi, g)| {
-                    let next = run.glyphs.get(gi + 1).map_or(g.1 + run.face.advance(g.0) * run.size / run.face.upem.max(1.0), |nx| nx.1);
-                    let range = ranges.get(gi).cloned().unwrap_or(text.len()..text.len());
-                    KrillaGlyph::new(GlyphId::new(g.0), ((next - g.1) / run.size) as f32, 0.0, ((g.2 - y0) / run.size) as f32, 0.0, range, None)
-                })
+                .filter(|(_, g)| g.0 != 0)
+                .filter_map(|(gi, _)| ranges.get(gi).map(|r| (r.start, r.end)))
                 .collect();
+            let mut kg: Vec<KrillaGlyph> = Vec::with_capacity(n);
+            for (gi, g) in run.glyphs.iter().enumerate() {
+                let next = run.glyphs.get(gi + 1).map_or(g.1 + run.face.advance(g.0) * run.size / run.face.upem.max(1.0), |nx| nx.1);
+                let range = ranges.get(gi).cloned().unwrap_or(text.len()..text.len());
+                // Krilla drops its NoCodepointMapping / ContainsNotDefGlyph validation
+                // errors unless a validator is configured (export configures none), so
+                // detect the loss here: a glyph with no font coverage or an empty text
+                // range still draws, but its character is unrecoverable from the PDF.
+                let sample = text
+                    .get(range.clone())
+                    .and_then(|t| t.chars().find(|c| !c.is_whitespace()))
+                    .or_else(|| run.cells.get(gi).map(|c| c.1).filter(|c| !c.is_whitespace()));
+                if let Some(c) = sample {
+                    if range.is_empty() || (g.0 == 0 && !mapped.contains(&(range.start, range.end))) {
+                        self.text_loss.note(c);
+                    }
+                }
+                kg.push(KrillaGlyph::new(GlyphId::new(g.0), ((next - g.1) / run.size) as f32, 0.0, ((g.2 - y0) / run.size) as f32, 0.0, range, None));
+            }
             s.push_transform(&tf(view * pt.transform * Affine::translate((x0, y0))));
             s.set_fill(Some(if visible {
                 let c = run.color;
@@ -655,47 +720,94 @@ impl Exporter<'_> {
         Ok((f, face))
     }
 
-    /// Wrapped plain text (notes).
+    /// Wrapped plain text (notes). Words are shaped with font fallback (see
+    /// [`shape_plain_word`]): the UI font has no CJK glyphs, so drawing the body with
+    /// it alone rendered every Chinese character as .notdef and the notes silently
+    /// vanished from the page.
     fn paragraphs(&mut self, s: &mut Surface, text: &str, area: Rect, size: f64) -> Result<()> {
-        let (font, face) = self.ui_font()?;
-        let k = size / face.upem.max(1.0);
-        let width = |w: &str| w.chars().map(|c| face.advance(face.glyph_for(c)) * k).sum::<f64>();
+        let (_, ui_face) = self.ui_font()?;
+        let space = ui_face.advance(ui_face.glyph_for(' ')) * (size / ui_face.upem.max(1.0));
         let lh = size * 1.3;
         let mut y = area.y0 + size;
         s.set_fill(Some(grey(0x20, 1.0)));
-        let space = width(" ");
         'outer: for para in text.split('\n') {
-            // The line's width is kept as words are added, not measured again for each word.
-            let mut line = String::new();
+            // The line's words and its width are kept as words are added, not measured
+            // again for each word. `line_filled` plays the role the old line string's
+            // emptiness played: an empty word (from repeated or leading spaces) adds
+            // its separator to a filled line but never fills one itself.
+            let mut line: Vec<ShapedWord> = Vec::new();
+            let mut line_filled = false;
             let mut line_w = 0.0;
             for word in para.split(' ') {
-                let word_w = width(word);
-                let cand_w = if line.is_empty() { word_w } else { line_w + space + word_w };
-                if cand_w > area.width() && !line.is_empty() {
+                let shaped = shape_plain_word(word, &ui_face, size);
+                let word_w: f64 = shaped.segs.iter().map(|seg| seg.3).sum();
+                let cand_w = if line_filled { line_w + space + word_w } else { word_w };
+                if cand_w > area.width() && line_filled {
                     if y > area.y1 {
                         break 'outer;
                     }
-                    s.draw_text(Point::from_xy(area.x0 as f32, y as f32), font.clone(), size as f32, &line, false, TextDirection::Auto);
+                    self.draw_plain_line(s, &line, area.x0, y, space, size)?;
                     y += lh;
-                    line = word.to_string();
+                    line_filled = !word.is_empty();
+                    line = if word.is_empty() { Vec::new() } else { vec![shaped] };
                     line_w = word_w;
                 } else {
-                    if !line.is_empty() {
-                        line.push(' ');
+                    if line_filled || !word.is_empty() {
+                        line.push(shaped);
                     }
-                    line.push_str(word);
+                    line_filled |= !word.is_empty();
                     line_w = cand_w;
                 }
             }
             if y > area.y1 {
                 break;
             }
-            if !line.is_empty() {
-                s.draw_text(Point::from_xy(area.x0 as f32, y as f32), font.clone(), size as f32, &line, false, TextDirection::Auto);
+            if line_filled {
+                self.draw_plain_line(s, &line, area.x0, y, space, size)?;
             }
             y += lh;
         }
         s.set_fill(None);
+        Ok(())
+    }
+
+    /// One wrapped line of plain text: each word's face runs in turn, glyphs placed
+    /// at the running pen, with the line's joined text as the ToUnicode source.
+    fn draw_plain_line(&mut self, s: &mut Surface, line: &[ShapedWord], x0: f64, y: f64, space: f64, size: f64) -> Result<()> {
+        let text: String = line.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ");
+        let mut x = x0;
+        let mut word_off = 0usize;
+        for (wi, w) in line.iter().enumerate() {
+            if wi > 0 {
+                x += space;
+                word_off += 1; // the joining space
+            }
+            for c in &w.lost {
+                self.text_loss.note(*c);
+            }
+            for seg in &w.segs {
+                let (face, seg_off, glyphs, seg_w) = (&seg.0, seg.1, &seg.2, seg.3);
+                let font = self.font(face)?;
+                let upem = face.upem.max(1.0);
+                let kg: Vec<KrillaGlyph> = glyphs
+                    .iter()
+                    .map(|(g, r)| {
+                        KrillaGlyph::new(
+                            GlyphId::new(g.gid),
+                            (g.x_advance as f64 / upem) as f32,
+                            (g.x_offset as f64 / upem) as f32,
+                            (-(g.y_offset as f64) / upem) as f32,
+                            0.0,
+                            (word_off + seg_off + r.start)..(word_off + seg_off + r.end),
+                            None,
+                        )
+                    })
+                    .collect();
+                s.draw_glyphs(Point::from_xy(x as f32, y as f32), &kg, font, &text, size as f32, false);
+                x += seg_w;
+            }
+            word_off += w.text.len();
+        }
         Ok(())
     }
 
@@ -745,6 +857,54 @@ impl Exporter<'_> {
         s.set_fill(None);
         Ok(())
     }
+}
+
+/// Shape one word of plain text with font fallback: consecutive characters the
+/// current face cannot cover switch to the face the font cascade resolves for them
+/// (the same cascade slide text uses), so scripts the starting face lacks — CJK in
+/// the UI font above all — still get real glyphs. The word starts in `ui`; marks and
+/// selectors stick to the preceding segment's face because the cascade is always
+/// offered that face first. A character no face covers keeps glyph 0 and is reported
+/// in the word's `lost`, so the export can fail instead of dropping it silently.
+fn shape_plain_word(word: &str, ui: &std::sync::Arc<deckcraft_fonts::FontFace>, size: f64) -> ShapedWord {
+    let db = FontDb::global();
+    let mut segs: Vec<(std::sync::Arc<deckcraft_fonts::FontFace>, String)> = Vec::new();
+    for ch in word.chars() {
+        let chain = segs.last().map_or_else(|| ui.clone(), |(f, _)| f.clone());
+        let face = if deckcraft_fonts::covers_cluster(&chain, &[ch]) { chain } else { db.cascade(&[ch], &[chain], "Regular") };
+        match segs.last_mut() {
+            Some((f, t)) if std::sync::Arc::ptr_eq(f, &face) => t.push(ch),
+            _ => segs.push((face, ch.to_string())),
+        }
+    }
+    let mut out = Vec::with_capacity(segs.len());
+    let mut lost = Vec::new();
+    let mut off = 0usize;
+    for (face, seg) in segs {
+        // The first strong character decides the segment's direction; the glyphs
+        // come back in visual order, the order draw_glyphs places them in.
+        let rtl = seg.chars().find(|c| c.is_alphabetic()).map_or(false, deckcraft_fonts::is_rtl);
+        let glyphs = deckcraft_fonts::shape_range(&face, &seg, 0..seg.len(), &deckcraft_fonts::ShapeParams { rtl, ..Default::default() }, |c| c);
+        let mut bounds: Vec<usize> = glyphs.iter().map(|g| g.cluster).collect();
+        bounds.sort_unstable();
+        bounds.dedup();
+        let k = size / face.upem.max(1.0);
+        let mut width = 0.0;
+        let mut shaped = Vec::with_capacity(glyphs.len());
+        for g in glyphs {
+            width += g.x_advance as f64 * k;
+            let end = bounds.get(bounds.partition_point(|&b| b <= g.cluster)).copied().unwrap_or(seg.len());
+            if g.gid == 0 {
+                if let Some(c) = seg.get(g.cluster..end).and_then(|t| t.chars().find(|c| !c.is_whitespace())) {
+                    lost.push(c);
+                }
+            }
+            shaped.push((g, g.cluster..end));
+        }
+        out.push((face, off, shaped, width));
+        off += seg.len();
+    }
+    ShapedWord { text: word.to_string(), segs: out, lost }
 }
 
 /// Byte range in `text` (the run's characters `chars`) of each of `n` glyphs, for the ToUnicode map.
