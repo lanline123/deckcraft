@@ -287,6 +287,38 @@ impl SlideApp {
         self.finalize_ime_reset(&ctx, custom);
     }
 
+    /// Draw the Normal editor inside a host region: thumbnail pane plus editable canvas only.
+    pub fn embedded_normal_ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        if !Self::root_viewport_admitted(&ctx) {
+            log::debug!("ignoring SlideApp::embedded_normal_ui for render-only viewport {:?}", ctx.viewport_id());
+            return;
+        }
+        self.ime_frame_viewport = Some(ctx.viewport_id());
+        self.ime_pending = None;
+        if !self.ui_setup(&ctx) {
+            self.requeue_injected_synthetic();
+            return;
+        }
+        let t0 = now_ms();
+        let t = theme::Tokens::get(&ctx);
+        self.note_ui_text(&ctx);
+        self.media.sync_video_textures(&ctx);
+        canvas::trackpad_twist(self, &ctx);
+        let editor_rect = ui.max_rect();
+        if ui.rect_contains_pointer(editor_rect) || self.session.active().is_some_and(|doc| doc.selection.text.is_some()) {
+            self.keyboard(&ctx);
+        }
+        thumbs::show(self, ui);
+        egui::CentralPanel::default().frame(egui::Frame::NONE.fill(t.canvas)).show(ui, |ui| canvas::show(self, ui));
+        self.drain_requests();
+        self.perf.frame_ms = now_ms() - t0;
+        self.ui_end(&ctx);
+        self.ime_frame_viewport = Some(ctx.viewport_id());
+        let custom = self.observe_ime(&ctx);
+        self.finalize_ime_reset(&ctx, custom);
+    }
+
     /// Run the admitted root UI pass, including setup gating, panels, canvas, dialogs, overlays, and
     /// show mode.
     fn ui_inner(&mut self, ui: &mut egui::Ui) {
